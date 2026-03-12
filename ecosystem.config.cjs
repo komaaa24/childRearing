@@ -1,7 +1,7 @@
 module.exports = {
     apps: [
         {
-            name: 'c',
+            name: 'ozish-api',
             cwd: __dirname,
             script: 'dist/main.js',
             node_args: ['-r', 'dotenv/config'],
