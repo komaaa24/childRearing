@@ -272,10 +272,19 @@ async function main() {
             console.warn("⚠️ Sherlar database connection failed (will use local payments only):", errorMsg);
         }
 
-        // Sync facts on startup
-        console.log("🔄 Syncing facts from API...");
-        await syncJokesFromAPI();
-        console.log("✅ Content synced");
+        // Sync facts on startup (optional)
+        const autoSync = (process.env.AUTO_SYNC_ON_STARTUP || "true").toLowerCase() !== "false";
+        if (autoSync) {
+            console.log("🔄 Syncing facts from API...");
+            try {
+                await syncJokesFromAPI();
+                console.log("✅ Content synced");
+            } catch (error) {
+                console.warn("⚠️ Startup sync skipped (API limited/unavailable):", error);
+            }
+        } else {
+            console.log("⏭️ Startup sync disabled by AUTO_SYNC_ON_STARTUP=false");
+        }
 
         // Start Express server
         app.listen(PORT, () => {

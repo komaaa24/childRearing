@@ -70,6 +70,7 @@ Telegram bot with Click payment integration for delivering weight-loss tips in R
    PROGRAMSOFT_API_URL=https://www.programsoft.uz/api
    PROGRAMSOFT_SERVICE_ID=165
    PROGRAMSOFT_PAGES=30
+   AUTO_SYNC_ON_STARTUP=true
    ```
 
 5. **Create database:**
@@ -178,6 +179,7 @@ https://yourdomain.com/webhook/pay
 | PROGRAMSOFT_API_URL | ProgramSoft API base | ✅ |
 | PROGRAMSOFT_SERVICE_ID | ProgramSoft service ID (`165`) | ❌ |
 | PROGRAMSOFT_PAGES | Number of pages to sync | ❌ |
+| AUTO_SYNC_ON_STARTUP | Sync on startup (`false` avoids 429 loops) | ❌ |
 | CLICK_SERVICE_ID | Click service ID | ✅ |
 | CLICK_MERCHANT_ID | Click merchant ID | ✅ |
 | CLICK_SECRET_KEY | Click secret key | ✅ |

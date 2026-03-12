@@ -1,7 +1,7 @@
 module.exports = {
     apps: [
         {
-            name: 'biznes-goyalar-bot',
+            name: 'c',
             cwd: __dirname,
             script: 'dist/main.js',
             node_args: ['-r', 'dotenv/config'],
