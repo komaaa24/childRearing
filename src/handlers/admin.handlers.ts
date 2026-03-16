@@ -4,12 +4,14 @@ import { AppDataSource } from "../database/data-source.js";
 import { Payment, PaymentStatus } from "../entities/Payment.js";
 import { User } from "../entities/User.js";
 import { UserService } from "../services/user.service.js";
+import { BotAccessService } from "../services/bot-access.service.js";
 import { getMessages, normalizeLanguage } from "../services/i18n.service.js";
 
 // Admin ID'lar ro'yxati
 const ADMIN_IDS = [7789445876, 1083408];
 const analyticsService = new AnalyticsService();
 const userService = new UserService();
+const botAccessService = new BotAccessService();
 
 /**
  * Admin tekshirish
@@ -462,6 +464,12 @@ export async function handleManualApprove(ctx: Context) {
 /**
  * Telegram ID orqali to'lovni tasdiqlash
  */
+function resolveBotKey(ctx: Context): string {
+    const envKey = (process.env.BOT_KEY || "").trim();
+    if (envKey) return envKey;
+    return (ctx.me?.username || "default").trim();
+}
+
 export async function handleApproveBytelegramId(ctx: Context, telegramId: number) {
     const userId = ctx.from?.id;
     if (!isSuperAdmin(userId)) {
@@ -487,7 +495,10 @@ export async function handleApproveBytelegramId(ctx: Context, telegramId: number
         return;
     }
 
-    if (user.hasPaid) {
+    const botKey = resolveBotKey(ctx);
+    const alreadyPaid = await botAccessService.hasPaidForBot(telegramId, botKey);
+
+    if (alreadyPaid) {
         await ctx.reply(
             `ℹ️ <b>Ma'lumot</b>\n\n` +
             `${user.firstName} (@${user.username || "no username"})\n` +
@@ -498,12 +509,12 @@ export async function handleApproveBytelegramId(ctx: Context, telegramId: number
     }
 
     // Pending to'lovlarni topish
-    const pendingPayment = await paymentRepo.findOne({
-        where: {
-            userId: user.id,
-            status: PaymentStatus.PENDING
-        }
-    });
+    const pendingPayment = await paymentRepo
+        .createQueryBuilder("payment")
+        .where("payment.userId = :userId", { userId: user.id })
+        .andWhere("payment.status = :status", { status: PaymentStatus.PENDING })
+        .andWhere("payment.metadata ->> 'botKey' = :botKey", { botKey })
+        .getOne();
 
     if (pendingPayment) {
         // To'lovni tasdiqlash
@@ -516,8 +527,8 @@ export async function handleApproveBytelegramId(ctx: Context, telegramId: number
         await paymentRepo.save(pendingPayment);
     }
 
-    // Foydalanuvchini to'lagan deb belgilash
-    await userService.markAsPaid(telegramId);
+    // Foydalanuvchini to'lagan deb belgilash (faqat shu bot uchun)
+    await botAccessService.markAsPaid(telegramId, botKey);
 
     // Foydalanuvchiga xabar va tugma yuborish
     try {
@@ -571,7 +582,10 @@ export async function handleRevokeByTelegramId(ctx: Context, telegramId: number)
     }
 
     // Obunani bekor qilish
-    if (!user.hasPaid) {
+    const botKey = resolveBotKey(ctx);
+    const hasPaid = await botAccessService.hasPaidForBot(telegramId, botKey);
+
+    if (!hasPaid) {
         return ctx.reply(
             `⚠️ <b>Obuna allaqachon yo'q!</b>\n\n` +
             `${user.firstName} (@${user.username || "no username"})\n` +
@@ -581,10 +595,8 @@ export async function handleRevokeByTelegramId(ctx: Context, telegramId: number)
         );
     }
 
-    // Obunani bekor qilish va revokedAt ni set qilish
-    user.hasPaid = false;
-    user.revokedAt = new Date();
-    await userRepo.save(user);
+    // Obunani bekor qilish faqat shu bot uchun
+    await botAccessService.revoke(telegramId, botKey);
 
     // Foydalanuvchiga xabar yuborish
     try {

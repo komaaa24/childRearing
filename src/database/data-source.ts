@@ -2,6 +2,7 @@ import "reflect-metadata";
 import "dotenv/config";
 import { DataSource } from "typeorm";
 import { Joke } from "../entities/Joke.js";
+import { BotAccess } from "../entities/BotAccess.js";
 import { Payment } from "../entities/Payment.js";
 import { User } from "../entities/User.js";
 
@@ -14,7 +15,7 @@ export const AppDataSource = new DataSource({
     database: process.env.DB_NAME || "pul_topish",
     synchronize: false, // Production'da false bo'lishi kerak
     logging: process.env.NODE_ENV === "development",
-    entities: [Joke, Payment, User],
+    entities: [Joke, Payment, User, BotAccess],
     subscribers: [],
     migrations: ["dist/migrations/*.js"],
     migrationsTableName: "migrations"

@@ -10,6 +10,7 @@ import { SherlarDataSource } from "./database/sherlar-data-source.js";
 import { Payment, PaymentStatus } from "./entities/Payment.js";
 import { User } from "./entities/User.js";
 import { UserService } from "./services/user.service.js";
+import { BotAccessService } from "./services/bot-access.service.js";
 import { generatePaymentLink, generateTransactionParam, getFixedPaymentAmount } from "./services/click.service.js";
 
 function required(name: string): string {
@@ -26,6 +27,8 @@ async function main() {
     console.log("📦 Connecting to main database...");
     await AppDataSource.initialize();
     console.log("✅ Main database connected");
+
+    const botAccessService = new BotAccessService();
 
     console.log("📦 Connecting to sherlar database...");
     await SherlarDataSource.initialize();
@@ -170,15 +173,10 @@ async function main() {
 
                     const telegramId = payment.metadata?.telegramId || user_id;
                     if (telegramId) {
-                        // Update user: hasPaid=true, clear revokedAt
-                        const userRepo = AppDataSource.getRepository(User);
-                        await userRepo
-                            .createQueryBuilder()
-                            .update(User)
-                            .set({ hasPaid: true, revokedAt: () => "NULL" })
-                            .where("telegramId = :telegramId", { telegramId })
-                            .execute();
-                        console.log(`✅ [GATEWAY] User ${telegramId} marked as paid, revokedAt cleared`);
+                        // Update user: hasPaid=true, clear revokedAt (per bot)
+                        const botKey = (payment.metadata?.botKey || String(req.query.bot_key || "").trim() || "default").trim();
+                        await botAccessService.markAsPaid(Number(telegramId), botKey);
+                        console.log(`✅ [GATEWAY] User ${telegramId} marked as paid for bot=${botKey}`);
 
                         // Forward notification request to main bot
                         try {
@@ -250,15 +248,10 @@ async function main() {
 
                     const telegramId = payment.metadata?.telegramId || user_id;
                     if (telegramId) {
-                        // Update user: hasPaid=true, clear revokedAt
-                        const userRepo = AppDataSource.getRepository(User);
-                        await userRepo
-                            .createQueryBuilder()
-                            .update(User)
-                            .set({ hasPaid: true, revokedAt: () => "NULL" })
-                            .where("telegramId = :telegramId", { telegramId })
-                            .execute();
-                        console.log(`✅ [GATEWAY] User ${telegramId} marked as paid, revokedAt cleared`);
+                        // Update user: hasPaid=true, clear revokedAt (per bot)
+                        const botKey = (payment.metadata?.botKey || String(req.query.bot_key || "").trim() || "default").trim();
+                        await botAccessService.markAsPaid(Number(telegramId), botKey);
+                        console.log(`✅ [GATEWAY] User ${telegramId} marked as paid for bot=${botKey}`);
 
                         try {
                             await axios.post('http://localhost:9988/internal/send-payment-notification', {

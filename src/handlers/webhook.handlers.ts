@@ -3,11 +3,13 @@ import { Repository } from "typeorm";
 import { Payment, PaymentStatus } from "../entities/Payment.js";
 import { AppDataSource } from "../database/data-source.js";
 import { UserService } from "../services/user.service.js";
+import { BotAccessService } from "../services/bot-access.service.js";
 import { Bot } from "grammy";
 import { verifyClickPaymentByMTI } from "../services/click-verify.service.js";
 import { getMessages, normalizeLanguage } from "../services/i18n.service.js";
 
 const userService = new UserService();
+const botAccessService = new BotAccessService();
 
 /**
  * 💰 Click to'lov webhook handler
@@ -155,12 +157,13 @@ export async function handlePaymentWebhook(req: Request, res: Response, bot: Bot
         };
         await paymentRepo.save(payment);
 
-        // Foydalanuvchini to'lagan deb belgilash
+        // Foydalanuvchini to'lagan deb belgilash (faqat shu bot uchun)
         const telegramId = payment.metadata?.telegramId;
         if (telegramId) {
-            await userService.markAsPaid(telegramId);
+            const botKey = (payment.metadata?.botKey || process.env.BOT_KEY || bot.botInfo?.username || "default").trim();
+            await botAccessService.markAsPaid(telegramId, botKey);
 
-            console.log(`✅ [WEBHOOK] User ${telegramId} marked as paid`);
+            console.log(`✅ [WEBHOOK] User ${telegramId} marked as paid for bot=${botKey}`);
 
             // 🎉 Telegram orqali tasdiq xabari yuborish
             try {
