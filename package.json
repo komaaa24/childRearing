@@ -7,7 +7,7 @@
         "dev": "tsx watch src/main.ts",
         "start": "tsx src/bot-simple.ts",
         "start:full": "tsx src/main.ts",
-        "build": "tsc",
+        "build": "node ./node_modules/typescript/bin/tsc",
         "start:prod": "node -r dotenv/config dist/main.js",
         "start:gateway": "node -r dotenv/config dist/gateway.js",
         "sync": "tsx src/scripts/sync-anecdotes.ts",

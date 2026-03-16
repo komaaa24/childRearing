@@ -11,6 +11,10 @@ export class UserService {
         this.userRepo = AppDataSource.getRepository(User);
     }
 
+    async findByTelegramId(telegramId: number): Promise<User | null> {
+        return this.userRepo.findOne({ where: { telegramId } });
+    }
+
     /**
      * Foydalanuvchini topish yoki yaratish
      */
@@ -39,7 +43,7 @@ export class UserService {
             const nextUsername = userData.username || user.username;
             const nextFirstName = userData.firstName || user.firstName;
             const nextLastName = userData.lastName || user.lastName;
-            const nextLanguage = normalizeLanguage(user.preferredLanguage || fallbackLanguage);
+            const nextLanguage = normalizeLanguage(userData.preferredLanguage || user.preferredLanguage || fallbackLanguage);
 
             const hasChanges =
                 nextUsername !== user.username ||

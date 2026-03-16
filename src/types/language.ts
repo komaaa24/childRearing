@@ -1,1 +1,1 @@
-export type BotLanguage = "ru";
+export type BotLanguage = "en" | "ru";

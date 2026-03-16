@@ -9,6 +9,8 @@ import { AppDataSource } from "./database/data-source.js";
 import { SherlarDataSource } from "./database/sherlar-data-source.js";
 import {
     handleStart,
+    handleLanguageMenu,
+    handleSetLanguage,
     handleShowJokes,
     handleNext,
     handlePayment,
@@ -57,6 +59,9 @@ bot.catch((err) => {
  * Bot command handlers
  */
 bot.command("start", handleStart);
+bot.command("language", async (ctx) => {
+    await handleLanguageMenu(ctx);
+});
 
 // Super Admin Panel
 bot.command("admin", handleAdminPanel);
@@ -152,6 +157,11 @@ bot.on("callback_query:data", async (ctx) => {
             await handleShowJokes(ctx);
         } else if (data === "back_to_start") {
             await handleStart(ctx);
+        } else if (data === "language_menu") {
+            await handleLanguageMenu(ctx);
+        } else if (data.startsWith("set_lang:")) {
+            const language = normalizeLanguage(data.replace("set_lang:", ""));
+            await handleSetLanguage(ctx, language);
         } else if (data.startsWith("next:")) {
             const index = parseInt(data.replace("next:", ""));
             await handleNext(ctx, index);
@@ -172,8 +182,10 @@ bot.on("callback_query:data", async (ctx) => {
         }
     } catch (error) {
         console.error("Callback query error:", error);
+        const language = await userService.getPreferredLanguage(ctx.from?.id || 0);
+        const messages = getMessages(language);
         await ctx.answerCallbackQuery({
-            text: "❌ Произошла ошибка. Пожалуйста, попробуйте снова.",
+            text: messages.processingError,
             show_alert: true
         });
     }
@@ -304,14 +316,16 @@ async function main() {
 
             // Oddiy foydalanuvchilar uchun komandalar
             await bot.api.setMyCommands([
-                { command: "start", description: "🚀 Перезапустить бота" }
+                { command: "start", description: "🚀 Restart bot" },
+                { command: "language", description: "🌐 Change language" }
             ]);
 
             // Admin uchun maxsus komandalar (har bir admin uchun alohida)
             const ADMIN_IDS = [7789445876, 1083408];
             const adminCommands = [
-                { command: "start", description: "🚀 Перезапустить бота" },
-                { command: "admin", description: "👑 Админ-панель" },
+                { command: "start", description: "🚀 Restart bot" },
+                { command: "language", description: "🌐 Change language" },
+                { command: "admin", description: "👑 Admin panel" },
                 { command: "approve", description: "✅ Подтвердить оплату" },
                 { command: "revoke", description: "🚫 Отозвать подписку" }
             ];

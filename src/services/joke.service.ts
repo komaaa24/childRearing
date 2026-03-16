@@ -31,12 +31,23 @@ export interface FetchFactsPageResult {
     lastPage?: number;
 }
 
-function resolveServiceId(): string {
-    const serviceId =
-        (process.env.PROGRAMSOFT_SERVICE_ID || "").trim() ||
-        (process.env.PROGRAMSOFT_RU_SERVICE_ID || "").trim() ||
-        "165";
-    return serviceId;
+function resolveServiceId(language: BotLanguage): string {
+    const envService =
+        language === "en"
+            ? (process.env.PROGRAMSOFT_EN_SERVICE_ID || "").trim()
+            : (process.env.PROGRAMSOFT_RU_SERVICE_ID || "").trim();
+
+    const fallbackService = (process.env.PROGRAMSOFT_SERVICE_ID || "").trim();
+
+    if (envService) {
+        return envService;
+    }
+
+    if (fallbackService) {
+        return fallbackService;
+    }
+
+    return language === "en" ? "76" : "138";
 }
 
 function resolveApiBaseUrl(): string {
@@ -45,6 +56,20 @@ function resolveApiBaseUrl(): string {
         throw new Error("Missing required env variable: PROGRAMSOFT_API_URL");
     }
     return apiBaseUrl.endsWith("/") ? apiBaseUrl.slice(0, -1) : apiBaseUrl;
+}
+
+export function resolveProgramsoftPageLimit(language: BotLanguage): number {
+    const perLanguagePages =
+        language === "en"
+            ? process.env.PROGRAMSOFT_EN_PAGES
+            : process.env.PROGRAMSOFT_RU_PAGES;
+
+    const configuredPages = Number(perLanguagePages || process.env.PROGRAMSOFT_PAGES);
+    if (Number.isFinite(configuredPages) && configuredPages > 0) {
+        return configuredPages;
+    }
+
+    return 30;
 }
 
 /**
@@ -56,7 +81,7 @@ export async function fetchFactsFromAPI(
 ): Promise<FetchFactsPageResult> {
     try {
         const base = resolveApiBaseUrl();
-        const serviceId = resolveServiceId();
+        const serviceId = resolveServiceId(language);
         const url = `${base}/service/${serviceId}?page=${page}`;
         const response = await fetch(url);
 
@@ -88,6 +113,21 @@ export async function fetchFactsFromAPI(
 }
 
 const KNOWN_LABELS = new Set([
+    "goal",
+    "step 1",
+    "step 2",
+    "step 3",
+    "nutrition",
+    "routine",
+    "training",
+    "sleep",
+    "water",
+    "mistakes",
+    "motivation",
+    "result",
+    "tip",
+    "recommendation",
+    "note",
     "цель",
     "шаг 1",
     "шаг 2",
@@ -156,7 +196,7 @@ export function formatJoke(item: JokeItem, language: BotLanguage): {
     dislikes: number;
 } {
     const externalId = `${language}:${item.id}`;
-    const raw = item.text || "Fact not found";
+    const raw = item.text || "Tip not found";
     const { title, body } = splitIdeaText(raw);
     const content = body || raw;
     const category = item.caption?.trim() || undefined;

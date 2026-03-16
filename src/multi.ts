@@ -8,6 +8,8 @@ import { Bot } from "grammy";
 import { AppDataSource } from "./database/data-source.js";
 import {
     handleStart,
+    handleLanguageMenu,
+    handleSetLanguage,
     handleShowJokes,
     handleNext,
     handlePayment,
@@ -15,7 +17,7 @@ import {
     syncJokesFromAPI
 } from "./handlers/bot.handlers.js";
 import { UserService } from "./services/user.service.js";
-import { getMessages } from "./services/i18n.service.js";
+import { getMessages, normalizeLanguage } from "./services/i18n.service.js";
 import { handlePaymentWebhook } from "./handlers/webhook.handlers.js";
 
 function required(name: string): string {
@@ -51,6 +53,9 @@ async function wireBot(bot: Bot) {
     bot.catch((err) => console.error("❌ Bot error:", err));
 
     bot.command("start", handleStart);
+    bot.command("language", async (ctx) => {
+        await handleLanguageMenu(ctx);
+    });
     bot.command("sync", async (ctx) => {
         const userId = ctx.from?.id;
         const adminIds = (process.env.ADMIN_IDS || "").split(",").map(Number);
@@ -80,6 +85,11 @@ async function wireBot(bot: Bot) {
                 await handleShowJokes(ctx);
             } else if (data === "back_to_start") {
                 await handleStart(ctx);
+            } else if (data === "language_menu") {
+                await handleLanguageMenu(ctx);
+            } else if (data.startsWith("set_lang:")) {
+                const language = normalizeLanguage(data.replace("set_lang:", ""));
+                await handleSetLanguage(ctx, language);
             } else if (data.startsWith("next:")) {
                 const index = parseInt(data.replace("next:", ""), 10);
                 await handleNext(ctx, index);
@@ -98,8 +108,10 @@ async function wireBot(bot: Bot) {
             }
         } catch (error) {
             console.error("Callback query error:", error);
+            const language = await userService.getPreferredLanguage(ctx.from?.id || 0);
+            const messages = getMessages(language);
             await ctx.answerCallbackQuery({
-                text: "❌ Произошла ошибка. Пожалуйста, попробуйте снова.",
+                text: messages.processingError,
                 show_alert: true
             });
         }

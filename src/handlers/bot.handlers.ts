@@ -4,14 +4,14 @@ import { User } from "../entities/User.js";
 import { Payment, PaymentStatus } from "../entities/Payment.js";
 import { AppDataSource } from "../database/data-source.js";
 import { UserService } from "../services/user.service.js";
-import { fetchFactsFromAPI, formatJoke } from "../services/joke.service.js";
+import { fetchFactsFromAPI, formatJoke, resolveProgramsoftPageLimit } from "../services/joke.service.js";
 import { generatePaymentLink, generateTransactionParam, getFixedPaymentAmount } from "../services/click.service.js";
 import { writeFile } from "fs/promises";
 import path from "path";
 import axios from "axios";
 import { SherlarPaymentService } from "../services/sherlar-payment.service.js";
 import { BotLanguage } from "../types/language.js";
-import { getMessages, normalizeLanguage } from "../services/i18n.service.js";
+import { detectLanguageFromTelegram, getMessages, normalizeLanguage, SUPPORTED_LANGUAGES } from "../services/i18n.service.js";
 
 const userService = new UserService();
 const sherlarPaymentService = new SherlarPaymentService();
@@ -23,6 +23,8 @@ interface UserSession {
 }
 
 const sessions = new Map<number, UserSession>();
+const languageSyncRetryAt = new Map<BotLanguage, number>();
+const SYNC_RETRY_COOLDOWN_MS = Number(process.env.SYNC_RETRY_COOLDOWN_MS || 180000);
 
 function escapeHtml(value: string): string {
     return value
@@ -46,16 +48,78 @@ async function answerCallbackSafe(
 }
 
 async function resolveUserLanguage(ctx: Context, userId: number): Promise<BotLanguage> {
-    const language = normalizeLanguage("ru");
+    const detectedLanguage = detectLanguageFromTelegram(ctx.from?.language_code);
+    const existingUser = await userService.findByTelegramId(userId);
+    const resolvedLanguage = normalizeLanguage(existingUser?.preferredLanguage || detectedLanguage);
 
     await userService.findOrCreate(userId, {
         username: ctx.from?.username,
         firstName: ctx.from?.first_name,
         lastName: ctx.from?.last_name,
-        preferredLanguage: language
+        // Keep user's selected language. Telegram UI language is only a fallback for brand new users.
+        preferredLanguage: resolvedLanguage
     });
 
-    return language;
+    return resolvedLanguage;
+}
+
+function getLanguageKeyboard(currentLanguage: BotLanguage): InlineKeyboard {
+    return new InlineKeyboard()
+        .text(`🇬🇧 English${currentLanguage === "en" ? " ✅" : ""}`, "set_lang:en")
+        .text(`🇷🇺 Русский${currentLanguage === "ru" ? " ✅" : ""}`, "set_lang:ru");
+}
+
+export async function handleLanguageMenu(ctx: Context, options?: { answerCallback?: boolean }) {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const language = await resolveUserLanguage(ctx, userId);
+    const messages = getMessages(language);
+    const keyboard = getLanguageKeyboard(language);
+
+    if (ctx.callbackQuery) {
+        await ctx.editMessageText(messages.languagePrompt, {
+            reply_markup: keyboard
+        });
+
+        if (options?.answerCallback !== false) {
+            await answerCallbackSafe(ctx);
+        }
+        return;
+    }
+
+    await ctx.reply(messages.languagePrompt, {
+        reply_markup: keyboard
+    });
+}
+
+export async function handleSetLanguage(ctx: Context, language: BotLanguage) {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    if (!SUPPORTED_LANGUAGES.includes(language)) {
+        await answerCallbackSafe(ctx, {
+            text: "Unsupported language",
+            show_alert: true
+        });
+        return;
+    }
+
+    await userService.setPreferredLanguage(userId, language);
+
+    const session = sessions.get(userId);
+    if (session) {
+        session.language = language;
+        session.currentIndex = 0;
+    }
+
+    const messages = getMessages(language);
+    await answerCallbackSafe(ctx, {
+        text: messages.languageUpdated,
+        show_alert: false
+    });
+
+    await handleShowJokes(ctx, { answerCallback: false });
 }
 
 async function showJoke(ctx: Context, userId: number, index: number, answerCallback = false) {
@@ -90,18 +154,17 @@ async function showJoke(ctx: Context, userId: number, index: number, answerCallb
         keyboard.text(messages.premiumButton, "payment");
     }
 
+    keyboard.row();
+    keyboard.text(messages.languageMenuButton, "language_menu");
+
     let text = `${messages.factCardTitle(index + 1, total)}\n\n`;
 
     if (joke.title) {
         text += `🎯 <b>${escapeHtml(joke.title.trim())}</b>\n\n`;
     }
 
-    if (joke.category) {
-        text += `🏷️ <b>${messages.categoryLabel}:</b> ${escapeHtml(joke.category.trim())}\n\n`;
-    }
-
     text += `💡 ${escapeHtml(joke.content.trim())}\n\n`;
-    text += `<i>Сохраните этот совет и примените его сегодня.</i>\n`;
+    text += `<i>${escapeHtml(messages.tipFooter)}</i>\n`;
 
     if (joke.views > 10) {
         text += `\n👁 ${joke.views.toLocaleString()} | `;
@@ -133,7 +196,22 @@ export async function handleStart(ctx: Context) {
     const userId = ctx.from?.id;
     if (!userId) return;
 
-    const language = await resolveUserLanguage(ctx, userId);
+    const existingUser = await userService.findByTelegramId(userId);
+    const detectedLanguage = detectLanguageFromTelegram(ctx.from?.language_code);
+
+    if (!existingUser) {
+        await userService.findOrCreate(userId, {
+            username: ctx.from?.username,
+            firstName: ctx.from?.first_name,
+            lastName: ctx.from?.last_name,
+            preferredLanguage: detectedLanguage
+        });
+
+        await handleLanguageMenu(ctx, { answerCallback: Boolean(ctx.callbackQuery) });
+        return;
+    }
+
+    const language = normalizeLanguage(existingUser.preferredLanguage || detectedLanguage);
 
     const user = await userService.findOrCreate(userId, {
         username: ctx.from?.username,
@@ -194,8 +272,24 @@ export async function handleShowJokes(
         where: { language }
     });
 
+    let syncFailed = false;
+
     if (languageCount === 0) {
-        await syncJokesFromAPI([language]);
+        const now = Date.now();
+        const retryAt = languageSyncRetryAt.get(language) || 0;
+
+        if (now >= retryAt) {
+            try {
+                await syncJokesFromAPI([language]);
+                languageSyncRetryAt.delete(language);
+            } catch (error) {
+                syncFailed = true;
+                languageSyncRetryAt.set(language, now + SYNC_RETRY_COOLDOWN_MS);
+                console.warn("⚠️ Sync failed for language=%s. Cooldown enabled.", language, error);
+            }
+        } else {
+            syncFailed = true;
+        }
     }
 
     let query = jokeRepo
@@ -210,13 +304,15 @@ export async function handleShowJokes(
     const jokes = await query.getMany();
 
     if (jokes.length === 0) {
+        const emptyStateText = syncFailed ? messages.syncFailed : messages.noFacts;
+
         if (ctx.callbackQuery) {
             await answerCallbackSafe(ctx, {
-                text: messages.noFacts,
+                text: emptyStateText,
                 show_alert: true
             });
         } else {
-            await ctx.reply(messages.noFacts);
+            await ctx.reply(emptyStateText);
         }
         return;
     }
@@ -434,15 +530,12 @@ export async function handleCheckPayment(ctx: Context, paymentId: number) {
 /**
  * API dan faktlarni sinxronlash
  */
-export async function syncJokesFromAPI(languages: BotLanguage[] = ["ru"]): Promise<void> {
+export async function syncJokesFromAPI(languages: BotLanguage[] = SUPPORTED_LANGUAGES): Promise<void> {
     const jokeRepo = AppDataSource.getRepository(Joke);
 
     try {
         for (const language of languages) {
-            const envPagesValue = process.env.PROGRAMSOFT_PAGES || process.env.PROGRAMSOFT_RU_PAGES;
-            const configuredPages = Number(envPagesValue);
-            const pageLimit = Number.isFinite(configuredPages) && configuredPages > 0 ? configuredPages : 30;
-
+            const pageLimit = resolveProgramsoftPageLimit(language);
             let page = 1;
             let synced = 0;
 
