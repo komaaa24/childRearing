@@ -1,0 +1,529 @@
+import { Context, InlineKeyboard } from "grammy";
+import { Repository } from "typeorm";
+import { Poem } from "../entities/Poem.js";
+import { User } from "../entities/User.js";
+import { Payment, PaymentStatus } from "../entities/Payment.js";
+import { AppDataSource } from "../database/data-source.js";
+import { UserService } from "../services/user.service.js";
+import { fetchPoemsFromAPI, formatPoem } from "../services/poem.service.js";
+import { generatePaymentLink, generateTransactionParam, getFixedPaymentAmount } from "../services/click.service.js";
+import { writeFile } from "fs/promises";
+import path from "path";
+import axios from "axios";
+import { SherlarPaymentService } from "../services/sherlar-payment.service.js";
+
+const userService = new UserService();
+const sherlarPaymentService = new SherlarPaymentService();
+
+// In-memory session storage
+interface UserSession {
+    poems: Poem[];
+    currentIndex: number;
+}
+
+const sessions = new Map<number, UserSession>();
+
+/**
+ * /start komandasi
+ */
+export async function handleStart(ctx: Context) {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    // Foydalanuvchini yaratish/yangilash
+    const user = await userService.findOrCreate(userId, {
+        username: ctx.from?.username,
+        firstName: ctx.from?.first_name,
+        lastName: ctx.from?.last_name
+    });
+
+    // 🔍 Smart payment verification strategy:
+    // 1. Agar hasPaid=true -> hech narsa qilmaymiz (tasdiqlangan)
+    // 2. Agar hasPaid=false -> sherlar DB ni tekshiramiz
+    // 3. Agar admin revoke qilgan bo'lsa (revokedAt mavjud) -> qayta tasdiqlamaymiz
+    // 4. To'lov topilsa -> FAQAT database'ni yangilaymiz, xabar YUBORMAYMIZ (webhook allaqachon yuborgan)
+    let hasPaid = user.hasPaid;
+
+    if (!hasPaid) {
+        console.log(`🔍 [START] Checking sherlar database for user: ${userId}`);
+        try {
+            const paymentResult = await sherlarPaymentService.hasValidPayment(userId);
+
+            if (paymentResult.hasPaid) {
+                // Admin revoke qilgan bo'lsa va to'lov revoke'dan oldin bo'lsa -> skip
+                if (user.revokedAt && paymentResult.paymentDate) {
+                    if (paymentResult.paymentDate < user.revokedAt) {
+                        console.log(`⚠️ [START] Payment found but user was revoked at ${user.revokedAt}. Skipping auto-approval.`);
+                        // Revoke qilingan, lekin yangi to'lov yo'q
+                    } else {
+                        // Yangi to'lov - revoke'dan keyin qilingan
+                        console.log(`✅ [START] New payment after revoke detected for user: ${userId}`);
+                        await userService.update(userId, { hasPaid: true, revokedAt: undefined });
+                        hasPaid = true;
+                        // Xabar yubormaymiz - webhook allaqachon yuborgan
+                    }
+                } else {
+                    // Revoke qilinmagan - oddiy auto-approval
+                    console.log(`✅ [START] Payment verified in sherlar DB for user: ${userId} - updating database only`);
+
+                    await userService.markAsPaid(userId);
+                    hasPaid = true;
+                    // Xabar YUBORMAYMIZ - webhook allaqachon yuborgan
+                }
+            } else {
+                console.log(`ℹ️ [START] No payment found in sherlar DB for user: ${userId}`);
+            }
+        } catch (error) {
+            console.error("❌ [START] Sherlar DB check error:", error);
+        }
+    }
+
+    // Welcome message - different for paid and unpaid users
+    const keyboard = new InlineKeyboard()
+        .text("❤️ She'rlarni o'qish", "show_poems");
+
+    if (hasPaid) {
+        // Paid users - creative unlimited access message
+        await ctx.reply(
+            `💖 <b>Xush kelibsiz aziz foydalanuvchi!</b>\n\n` +
+            `🎉 Sizda cheksiz she'rlar kolleksiyasiga to'liq kirish huquqi mavjud!\n\n` +
+            `� Minglab go'zal sevgi she'rlari sizni kutmoqda. Har bir she'r - yurakdan yurakka yo'l topgan so'zlar.\n\n` +
+            `✨ <i>Muhabbat - bu dunyo tillarida eng chiroyli she'rdir...</i>\n\n` +
+            `She'rlardan bahramand bo'lish uchun quyidagi tugmani bosing 👇`,
+            {
+                reply_markup: keyboard,
+                parse_mode: "HTML"
+            }
+        );
+    } else {
+        // Unpaid users - free trial message
+        await ctx.reply(
+            `�💝 <b>Sevgi she'rlari botiga xush kelibsiz!</b>\n\n` +
+            `📖 Go'zal sevgi she'rlari sizni kutmoqda.\n\n` +
+            `💡 <b>Qanday ishlaydi?</b>\n` +
+            `• 5 ta she'rni bepul o'qing\n` +
+            `• Davomini o'qish uchun bir martalik to'lov qiling (${getFixedPaymentAmount()} so'm)\n` +
+            `• Cheksiz she'rlardan bahramand bo'ling!\n\n` +
+            `Boshlash uchun quyidagi tugmani bosing 👇`,
+            {
+                reply_markup: keyboard,
+                parse_mode: "HTML"
+            }
+        );
+    }
+}
+
+/**
+ * She'rlarni ko'rsatish
+ */
+export async function handleShowPoems(ctx: Context) {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const poemRepo = AppDataSource.getRepository(Poem);
+
+    // HAR SAFAR yangi tekshiruv (revoke uchun)
+    let hasPaid = await userService.hasPaid(userId);
+
+    // FAQAT /start da sherlar DB tekshiriladi, bu yerda EMAS!
+
+    // Agar DB bo'sh bo'lsa, API dan yuklaymiz
+    const count = await poemRepo.count();
+    if (count === 0) {
+        await syncPoemsFromAPI();
+    }
+
+    // Tasodifiy she'rlarni olish
+    const poems = await poemRepo
+        .createQueryBuilder("poem")
+        .orderBy("RANDOM()")
+        .limit(hasPaid ? 20 : 5)
+        .getMany();
+
+    if (poems.length === 0) {
+        await ctx.answerCallbackQuery({
+            text: "She'rlar topilmadi 😔",
+            show_alert: true
+        });
+        return;
+    }
+
+    // Session yaratish
+    sessions.set(userId, {
+        poems,
+        currentIndex: 0
+    });
+
+    await showPoem(ctx, userId, 0);
+}
+
+/**
+ * She'rni ko'rsatish - oddiy matn
+ */
+async function showPoem(ctx: Context, userId: number, index: number) {
+    const session = sessions.get(userId);
+    if (!session) return;
+
+    const poem = session.poems[index];
+    const total = session.poems.length;
+    const hasPaid = await userService.hasPaid(userId);
+
+    // Ko'rilgan she'rlar sonini oshirish
+    await userService.incrementViewedAnecdotes(userId);
+
+    // Increment views
+    const poemRepo = AppDataSource.getRepository(Poem);
+    poem.views += 1;
+    await poemRepo.save(poem);
+
+    const keyboard = new InlineKeyboard();
+
+    if (index < total - 1) {
+        keyboard.text("Keyingi", `next:${index + 1}`);
+    }
+
+    if (index > 0) {
+        keyboard.text("Oldingi", `next:${index - 1}`);
+    }
+
+    keyboard.row();
+    keyboard.text("Bo'limlarga qaytish", "back_to_start");
+
+    // Agar to'lov qilmagan bo'lsa va oxirgi she'r ko'rsatilayotgan bo'lsa
+    if (!hasPaid && index === total - 1) {
+        keyboard.row();
+        keyboard.text("💳 To'lov qilish", "payment");
+    }
+
+    // Oddiy matn shaklida
+    let text = `<b>${poem.content}</b>\n\n`;
+    text += `🙂 <i>${poem.views} marta ko'rilgan</i>`;
+
+    // Matnni yuborish
+    if (ctx.callbackQuery) {
+        await ctx.editMessageText(text, {
+            reply_markup: keyboard,
+            parse_mode: "HTML"
+        });
+        await ctx.answerCallbackQuery();
+    } else {
+        await ctx.reply(text, {
+            reply_markup: keyboard,
+            parse_mode: "HTML"
+        });
+    }
+}
+
+/**
+ * Keyingi/oldingi she'r
+ */
+/**
+ * Keyingi/Oldingi she'rni ko'rsatish
+ */
+export async function handleNext(ctx: Context, index: number) {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    // HAR SAFAR hasPaid ni tekshirish (revoke uchun muhim!)
+    const hasPaid = await userService.hasPaid(userId);
+    const session = sessions.get(userId);
+
+    if (!session) {
+        await ctx.answerCallbackQuery({
+            text: "Session tugagan. /start ni bosing.",
+            show_alert: true
+        });
+        return;
+    }
+
+    // Agar revoke qilingan bo'lsa va 5 tadan ko'p she'r ko'rmoqchi bo'lsa
+    if (!hasPaid && index >= 5) {
+        await ctx.answerCallbackQuery({
+            text: "❌ Obunangiz bekor qilindi! Faqat 5 ta bepul she'r.",
+            show_alert: true
+        });
+
+        // To'lov tugmasini ko'rsatish
+        const keyboard = new InlineKeyboard()
+            .text("💳 To'lov qilish", "payment");
+
+        await ctx.editMessageText(
+            `⚠️ <b>Obunangiz bekor qilindi!</b>\n\n` +
+            `Siz faqat 5 ta bepul she'rni ko'rishingiz mumkin.\n\n` +
+            `Cheksiz she'rlardan bahramand bo'lish uchun qaytadan to'lov qiling.`,
+            {
+                reply_markup: keyboard,
+                parse_mode: "HTML"
+            }
+        );
+        return;
+    }
+
+    await showPoem(ctx, userId, index);
+}
+
+/**
+ * To'lov oynasini ko'rsatish
+ */
+export async function handlePayment(ctx: Context) {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const user = await userService.findOrCreate(userId);
+
+    if (user.hasPaid) {
+        await ctx.answerCallbackQuery({
+            text: "Siz allaqachon to'lov qilgansiz! ✅",
+            show_alert: true
+        });
+        return;
+    }
+
+    // To'lov parametrlari - qat'iy narx
+    const amount = getFixedPaymentAmount(); // 1111 so'm
+    const transactionParam = generateTransactionParam();
+
+    // Payment record yaratish
+    const paymentRepo = AppDataSource.getRepository(Payment);
+    const payment = paymentRepo.create({
+        transactionParam,
+        userId: user.id,
+        amount,
+        status: PaymentStatus.PENDING,
+        metadata: {
+            telegramId: userId,
+            username: ctx.from?.username
+        }
+    });
+    await paymentRepo.save(payment);
+
+    // Oddiy to'lov linkini yaratish (user_id va return_url bilan)
+    const botUsername = ctx.me?.username || "sevgiSozlari_bot";
+    const returnUrl = `https://t.me/${botUsername}`;
+
+    const paymentLink = generatePaymentLink({
+        amount,
+        transactionParam,
+        userId, // Telegram ID qo'shish
+        returnUrl // To'lovdan keyin botga qaytish
+    });
+
+    const keyboard = new InlineKeyboard()
+        .url("💳 To'lash", paymentLink.url)
+        .row()
+        .text("✅ To'lovni tekshirish", `check_payment:${payment.id}`)
+        .row()
+        .text("❌ Bekor qilish", "cancel_payment");
+
+    await ctx.editMessageText(
+        `💰 <b>To'lov ma'lumotlari</b>\n\n` +
+        `💵 Summa: <b>${amount.toLocaleString()} so'm</b> (qat'iy narx)\n` +
+        `🔐 Tranzaksiya: <code>${transactionParam}</code>\n\n` +
+        `📱 <b>To'lash:</b>\n` +
+        `1️⃣ "To'lash" tugmasini bosing\n` +
+        `2️⃣ To'lovni amalga oshiring\n` +
+        `3️⃣ To'lov tugagach avtomatik botga qaytasiz\n` +
+        `4️⃣ "To'lovni tekshirish" tugmasini bosing\n\n` +
+        `✅ To'lov tasdiqlanishi bilanoq cheksiz she'rlardan bahramand bo'lasiz!`,
+        {
+            reply_markup: keyboard,
+            parse_mode: "HTML"
+        }
+    );
+}
+
+/**
+ * To'lovni tekshirish
+ */
+export async function handleCheckPayment(ctx: Context, paymentId: number) {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const paymentRepo = AppDataSource.getRepository(Payment);
+    const payment = await paymentRepo.findOne({
+        where: { id: paymentId },
+        relations: ["user"]
+    });
+
+    if (!payment) {
+        await ctx.answerCallbackQuery({
+            text: "To'lov topilmadi ❌",
+            show_alert: true
+        });
+        return;
+    }
+
+    // Agar allaqachon to'langan bo'lsa
+    if (payment.status === PaymentStatus.PAID) {
+        await ctx.answerCallbackQuery({
+            text: "To'lovingiz tasdiqlandi! ✅",
+            show_alert: true
+        });
+
+        await ctx.editMessageText(
+            `✅ <b>To'lov muvaffaqiyatli!</b>\n\n` +
+            `Endi siz cheksiz she'rlardan bahramand bo'lishingiz mumkin! 🎉\n\n` +
+            `Davom etish uchun /start bosing.`,
+            { parse_mode: "HTML" }
+        );
+        return;
+    }
+
+    // Agar PENDING bo'lsa, sherlar DB'dan tekshiramiz
+    if (payment.status === PaymentStatus.PENDING) {
+        await ctx.answerCallbackQuery({
+            text: "🔍 To'lov tekshirilmoqda...",
+            show_alert: false
+        });
+
+        console.log(`🔍 [CHECK_PAYMENT] Checking sherlar DB for user: ${userId}`);
+
+        try {
+            // Sherlar DB'dan to'lovni tekshirish
+            const paymentResult = await sherlarPaymentService.hasValidPayment(userId);
+
+            if (paymentResult.hasPaid) {
+                console.log(`✅ [CHECK_PAYMENT] Payment found in sherlar DB for user: ${userId}`);
+
+                // Local DB'ni yangilash
+                payment.status = PaymentStatus.PAID;
+                await paymentRepo.save(payment);
+
+                // User'ni to'lagan deb belgilash va revokedAt'ni tozalash
+                const userRepo = AppDataSource.getRepository(User);
+                await userRepo
+                    .createQueryBuilder()
+                    .update(User)
+                    .set({ hasPaid: true, revokedAt: () => "NULL" })
+                    .where("telegramId = :telegramId", { telegramId: userId })
+                    .execute();
+
+                console.log(`✅ [CHECK_PAYMENT] User ${userId} marked as paid`);
+
+                // Success xabar
+                await ctx.editMessageText(
+                    `✅ <b>To'lovingiz tasdiqlandi!</b>\n\n` +
+                    `💰 Summa: ${payment.amount} so'm\n` +
+                    `🎉 Endi siz cheksiz she'rlardan bahramand bo'lishingiz mumkin!\n\n` +
+                    `Davom etish uchun /start bosing.`,
+                    { parse_mode: "HTML" }
+                );
+            } else {
+                console.log(`ℹ️ [CHECK_PAYMENT] No payment found for user: ${userId}`);
+
+                // To'lov topilmadi
+                await ctx.editMessageText(
+                    `⏳ <b>To'lov hali tasdiqlanmadi</b>\n\n` +
+                    `💡 To'lovni amalga oshirganingizdan so'ng biroz kuting va qayta tekshiring.\n\n` +
+                    `Agar to'lov qilgan bo'lsangiz va hali ham ko'rinmasa, admin bilan bog'laning.`,
+                    { parse_mode: "HTML" }
+                );
+            }
+        } catch (error) {
+            console.error("❌ [CHECK_PAYMENT] Error checking payment:", error);
+
+            await ctx.editMessageText(
+                `❌ <b>Xatolik yuz berdi</b>\n\n` +
+                `To'lovni tekshirishda xatolik. Iltimos qaytadan urinib ko'ring yoki admin bilan bog'laning.`,
+                { parse_mode: "HTML" }
+            );
+        }
+        return;
+    }
+
+    // Agar to'lov muvaffaqiyatsiz bo'lsa
+    await ctx.answerCallbackQuery({
+        text: "To'lov muvaffaqiyatsiz tugadi ❌",
+        show_alert: true
+    });
+}
+
+/**
+ * API dan she'rlarni sinxronlash
+ */
+export async function syncPoemsFromAPI() {
+    const poemRepo = AppDataSource.getRepository(Poem);
+
+    try {
+        const maxPages = Number(process.env.PROGRAMSOFT_PAGES) || 12;
+
+        for (let page = 1; page <= maxPages; page++) {
+            const items = await fetchPoemsFromAPI(page);
+
+            for (const item of items) {
+                const formatted = formatPoem(item);
+
+                const existing = await poemRepo.findOne({
+                    where: { externalId: formatted.externalId }
+                });
+
+                if (!existing) {
+                    const poem = poemRepo.create({
+                        externalId: formatted.externalId,
+                        content: formatted.content,
+                        author: formatted.author,
+                        title: formatted.title,
+                        likes: formatted.likes,
+                        dislikes: formatted.dislikes
+                    });
+                    await poemRepo.save(poem);
+                }
+            }
+        }
+
+        console.log("✅ Poems synced successfully");
+    } catch (error) {
+        console.error("❌ Error syncing poems:", error);
+    }
+}
+
+/**
+ * Admin: Fon rasmini yuklash (faqat photo yuborilganda)
+ */
+export async function handleUploadBackground(ctx: Context) {
+    const userId = ctx.from?.id;
+    const adminId = Number(process.env.ADMIN_ID) || 7789445876;
+
+    if (userId !== adminId) {
+        await ctx.reply("❌ Bu buyruq faqat admin uchun!");
+        return;
+    }
+
+    const photo = ctx.message?.photo;
+    if (!photo || photo.length === 0) {
+        await ctx.reply("❌ Iltimos rasm yuboring!");
+        return;
+    }
+
+    try {
+        // Eng katta o'lchamdagi rasmni olish
+        const largestPhoto = photo[photo.length - 1];
+        const file = await ctx.api.getFile(largestPhoto.file_id);
+
+        if (!file.file_path) {
+            throw new Error("File path not found");
+        }
+
+        // Rasmni yuklab olish
+        const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
+        const response = await axios.get(fileUrl, {
+            responseType: "arraybuffer"
+        });
+
+        // assets/background.jpg ga saqlash
+        const backgroundPath = path.join(process.cwd(), "assets", "background.jpg");
+        await writeFile(backgroundPath, response.data);
+
+        await ctx.reply(
+            "✅ <b>Fon rasmi muvaffaqiyatli yangilandi!</b>\n\n" +
+            "📁 Fayl: assets/background.jpg\n" +
+            "📏 O'lcham: " + (response.data.byteLength / 1024).toFixed(2) + " KB\n\n" +
+            "Endi barcha she'rlar yangi fon bilan ko'rsatiladi! 🎨",
+            { parse_mode: "HTML" }
+        );
+    } catch (error) {
+        console.error("Error uploading background:", error);
+        const errorMessage = error instanceof Error ? error.message : "Noma'lum xatolik";
+        await ctx.reply("❌ Xatolik yuz berdi: " + errorMessage);
+    }
+}
